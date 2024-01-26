@@ -3,12 +3,10 @@ using PuppeteerSharp;
 using StackExchange.Redis;
 using System.Text.Json;
 
-HttpClient _scClient = null;
+const int TIMEOUT_MS = 60_000;
+
 Conf _conf = Deserialize<Conf>(GetEnvValue("CONF"));
-if (!string.IsNullOrWhiteSpace(_conf.ScKey))
-{
-    _scClient = new HttpClient();
-}
+HttpClient _scClient = new();
 
 #region redis
 
@@ -31,33 +29,44 @@ for (int i = 0; i < _conf.Users.Length; i++)
     string cookie = string.Empty;
     bool isInvalid = true; string result = string.Empty;
 
-    string redisKey = $"Note163_{user.Username}";
-    if (isRedis)
+    if (!string.IsNullOrWhiteSpace(user.Cookie))
     {
-        var redisValue = await db.StringGetAsync(redisKey);
-        if (redisValue.HasValue)
-        {
-            cookie = redisValue.ToString();
-            (isInvalid, result) = await IsInvalid(cookie);
-            Console.WriteLine("redis获取cookie,状态:{0}", isInvalid ? "无效" : "有效");
-        }
+        Console.WriteLine("json-cookie存在,开始验证...");
+        cookie = user.Cookie;
+        (isInvalid, result) = await IsInvalid(cookie);
+        Console.WriteLine("json-cookie状态:{0}", isInvalid ? "无效" : "有效");
     }
 
     if (isInvalid)
     {
-        cookie = await Login(user.Username, user.Password);
-        (isInvalid, result) = await IsInvalid(cookie);
-        Console.WriteLine("login获取cookie,状态:{0}", isInvalid ? "无效" : "有效");
-        if (isInvalid)
-        {//Cookie失效
-            await Notify($"{title}Cookie失效，请检查登录状态！", true);
-            continue;
+        string redisKey = $"Note163_{user.Username}";
+        if (isRedis)
+        {
+            var redisValue = await db.StringGetAsync(redisKey);
+            if (redisValue.HasValue)
+            {
+                cookie = redisValue.ToString();
+                (isInvalid, result) = await IsInvalid(cookie);
+                Console.WriteLine("redis获取cookie,状态:{0}", isInvalid ? "无效" : "有效");
+            }
         }
-    }
 
-    if (isRedis)
-    {
-        Console.WriteLine($"redis更新cookie:{await db.StringSetAsync(redisKey, cookie)}");
+        if (isInvalid)
+        {
+            cookie = await GetCookie(user);
+            (isInvalid, result) = await IsInvalid(cookie);
+            Console.WriteLine("login获取cookie,状态:{0}", isInvalid ? "无效" : "有效");
+            if (isInvalid)
+            {//Cookie失效
+                await Notify($"{title}Cookie失效，请检查登录状态！", true);
+                continue;
+            }
+        }
+
+        if (isRedis)
+        {
+            Console.WriteLine($"redis更新cookie:{await db.StringSetAsync(redisKey, cookie)}");
+        }
     }
 
     #endregion
@@ -105,7 +114,7 @@ async Task<(bool isInvalid, string result)> IsInvalid(string cookie)
     return (result.Contains("error", StringComparison.OrdinalIgnoreCase), result);
 }
 
-async Task<string> Login(string username, string password)
+async Task<string> GetCookie(User user)
 {
     var launchOptions = new LaunchOptions
     {
@@ -114,32 +123,76 @@ async Task<string> Login(string username, string password)
         ExecutablePath = @"/usr/bin/google-chrome"
     };
     var browser = await Puppeteer.LaunchAsync(launchOptions);
-    Page page = await browser.DefaultContext.NewPageAsync();
+    IPage page = await browser.DefaultContext.NewPageAsync();
 
-    await page.GoToAsync("https://note.youdao.com/web", 60_000);
-    await page.WaitForSelectorAsync(".login-btn", new WaitForSelectorOptions { Visible = true });
-    await page.TypeAsync(".login-username", username);
-    await page.TypeAsync(".login-password", password);
-    await Task.Delay(5_000);
-    await page.ClickAsync(".login-btn");
-    await page.WaitForSelectorAsync("ydoc-app", new WaitForSelectorOptions { Visible = true });
+    await page.GoToAsync(_conf.LoginUrl, TIMEOUT_MS);
 
-    var client = await page.Target.CreateCDPSessionAsync();
-    var ckObj = await client.SendAsync("Network.getAllCookies");
-    var cks = ckObj.Value<JArray>("cookies")
-        .Where(p => p.Value<string>("domain").Contains("note.youdao.com"))
-        .Select(p => $"{p.Value<string>("name")}={p.Value<string>("value")}");
+    bool isLogin = false;
+    string cookie = "fail";
+    try
+    {
+        #region 登录
 
-    await browser.DisposeAsync();
-    return string.Join(';', cks);
+        //登录
+        _ = Login(page, user);
+        int totalDelayMs = 0, delayMs = 100;
+        while (true)
+        {
+            if ((isLogin = IsLogin(page))
+                || totalDelayMs > TIMEOUT_MS)
+            {
+                break;
+            }
+            await Task.Delay(delayMs);
+            totalDelayMs += delayMs;
+        }
+
+        if (isLogin)
+        {
+            var client = await page.Target.CreateCDPSessionAsync();
+            var ckObj = await client.SendAsync("Network.getAllCookies");
+            var cks = ckObj.Value<JArray>("cookies")
+                .Where(p => p.Value<string>("domain").Contains("note.youdao.com"))
+                .Select(p => $"{p.Value<string>("name")}={p.Value<string>("value")}");
+            cookie = string.Join(';', cks);
+        }
+
+        #endregion
+    }
+    catch (Exception ex)
+    {
+        cookie = "ex";
+        Console.WriteLine($"处理Page时出现异常！{ex.Message}；{ex.StackTrace}");
+    }
+    finally
+    {
+        await browser.DisposeAsync();
+    }
+
+    return cookie;
 }
+
+async Task Login(IPage page, User user)
+{
+    try
+    {
+        string js = await _scClient.GetStringAsync(_conf.JsUrl);
+        await page.EvaluateExpressionAsync(js.Replace("@U", user.Username).Replace("@P", user.Password));
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Login时出现异常！{ex.Message}. {ex.StackTrace}");
+    }
+}
+
+bool IsLogin(IPage page) => !page.Url.Contains(_conf.LoginStr, StringComparison.OrdinalIgnoreCase);
 
 async Task Notify(string msg, bool isFailed = false)
 {
     Console.WriteLine(msg);
     if (_conf.ScType == "Always" || (isFailed && _conf.ScType == "Failed"))
     {
-        await _scClient?.GetAsync($"https://sc.ftqq.com/{_conf.ScKey}.send?text={msg}");
+        await _scClient.GetAsync($"https://sc.ftqq.com/{_conf.ScKey}.send?text={msg}");
     }
 }
 
@@ -160,6 +213,9 @@ class Conf
     public string ScType { get; set; }
     public string RdsServer { get; set; }
     public string RdsPwd { get; set; }
+    public string LoginUrl { get; set; } = "https://note.youdao.com/mobileSignIn/login_mobile.html?&back_url=https://note.youdao.com/web/&from=web";
+    public string LoginStr { get; set; } = "signIn";
+    public string JsUrl { get; set; } = "https://github.com/BlueHtml/pub/raw/main/code/js/note163login.js";
 }
 
 class User
@@ -167,6 +223,7 @@ class User
     public string Task { get; set; }
     public string Username { get; set; }
     public string Password { get; set; }
+    public string Cookie { get; set; }
 }
 
 #endregion
